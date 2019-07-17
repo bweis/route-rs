@@ -400,4 +400,37 @@ mod tests {
         assert_eq!(elem0_port1_output.len(), 1000);
     }
 
+    #[test]
+    fn one_split_element_collected_yield_only_odd() {
+        let default_channel_size = 5;
+        let number_branches = 2;
+        let packets = vec![1, 1337, 3, 5, 7, 9, 11];
+        let packet_generator = PacketIntervalGenerator::new(time::Duration::from_millis(100), packets.clone().into_iter());
+
+        let elem0 = SplitEvenOddElement { id: 0 };
+
+        let mut elem0_link = SplitElementLink::new(Box::new(packet_generator), elem0, default_channel_size, number_branches);
+        let elem0_drain = elem0_link.consumer;
+
+        // Ordering is important since we are popping, too tired to do this cleaner :).   
+        let (s1, elem0_port1_collector_output) = crossbeam::crossbeam_channel::unbounded();
+        let elem0_port1_collector = ExhaustiveCollector::new(0, Box::new(elem0_link.providers.pop().unwrap()), s1);
+
+        let (s0, elem0_port0_collector_output) = crossbeam::crossbeam_channel::unbounded();
+        let elem0_port0_collector = ExhaustiveCollector::new(0, Box::new(elem0_link.providers.pop().unwrap()), s0);
+
+        tokio::run(lazy (|| {
+            tokio::spawn(elem0_drain);
+            tokio::spawn(elem0_port0_collector);
+            tokio::spawn(elem0_port1_collector);
+            Ok(())
+        }));
+
+        let elem0_port0_output: Vec<_> = elem0_port0_collector_output.iter().collect();
+        assert!(elem0_port0_output.is_empty());
+
+        let elem0_port1_output: Vec<_> = elem0_port1_collector_output.iter().collect();
+        assert_eq!(elem0_port1_output, vec![1, 1337, 3, 5, 7, 9, 11]);
+    }
+
 }
