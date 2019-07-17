@@ -466,3 +466,191 @@ impl<E: SplitElement> Stream for SplitElementProvider<E> {
         }
     }
 }
+
+
+pub struct JoinElementLink<Packet: Sized> {
+    pub consumers: Vec<JoinElementConsumer<Packet>>,
+    pub provider: JoinElementProvider<Packet>
+}
+
+impl<Packet: Sized> JoinElementLink<Packet> {
+    pub fn new(input_streams: Vec<ElementStream<Packet>>, queue_capacity: usize) -> Self {
+        assert!( input_streams.len() <= 1000, format!("input_steams len {} > 1000", input_streams.len())); //Let's be reasonable here
+        assert!( queue_capacity <= 1000, format!("Split Element queue_capacity: {} > 1000", queue_capacity));
+
+        let number_consumers = input_streams.len();
+        let (to_provider, from_consumers) = crossbeam_channel::bounded::<Option<Packet>>(queue_capacity);
+        let (await_provider, wake_consumers) = crossbeam_channel::bounded::<task::Task>(number_consumers);
+        let (await_consumers, wake_provider) = crossbeam_channel::bounded::<task::Task>(1);
+
+        let mut consumers: Vec<JoinElementConsumer<Packet>> = Vec::new();
+
+        for input_stream in input_streams {
+            let consumer = JoinElementConsumer::new(input_stream, to_provider.clone(), await_provider.clone(), wake_provider.clone());
+            consumers.push(consumer);
+        }
+
+        let provider = JoinElementProvider::new(from_consumers, await_consumers, wake_consumers, number_consumers);
+
+        JoinElementLink {
+            consumers,
+            provider
+        }
+    }
+}
+
+pub struct JoinElementConsumer<Packet: Sized> {
+    input_stream: ElementStream<Packet>,
+    to_provider: Sender<Option<Packet>>,
+    await_provider: Sender<task::Task>,
+    wake_provider: Receiver<task::Task>
+}
+
+impl<Packet: Sized> JoinElementConsumer<Packet> {
+    fn new(
+        input_stream: ElementStream<Packet>, 
+        to_provider: Sender<Option<Packet>>, 
+        await_provider: Sender<task::Task>,
+        wake_provider: Receiver<task::Task>) 
+    -> Self {
+        JoinElementConsumer {
+            input_stream,
+            to_provider,
+            await_provider,
+            wake_provider
+        }
+    }
+}
+
+impl<Packet: Sized> Drop for JoinElementConsumer<Packet> {
+    fn drop(&mut self) {
+        if let Err(err) = self.to_provider.try_send(None) {
+            panic!("Consumer: Drop: try_send to_provider, fail?: {:?}", err);
+        }
+
+        // Since there are many providers, this may not be strictly necessary, but it is safer, and since
+        // we just pushed the None there is work for the provider to do.
+        if let Ok(task) = self.wake_provider.try_recv() {
+            task.notify();
+        } 
+    }
+}
+
+impl<Packet: Sized> Future for JoinElementConsumer<Packet> {
+    type Item = ();
+    type Error = ();
+
+    /// Implement Poll for Future for JoinElementConsumer
+    /// 
+    /// Note that this function works a bit different, it continues to process
+    /// packets off it's input queue until it reaches a point where it can not
+    /// make forward progress. There are three cases:
+    /// ###
+    /// #1 The to_provider queue is full, we notify the provider that we need
+    /// awaking when there is work to do, and go to sleep.
+    /// 
+    /// #2 The input_stream returns a NotReady, we sleep, with the assumption
+    /// that whomever produced the NotReady will awaken the task in the Future.
+    /// 
+    /// #3 We get a Ready(None), in which case we push a None onto the to_provider
+    /// queue and then return Ready(()), which means we enter tear-down, since there
+    /// is no futher work to complete.
+    /// ###
+    /// By Sleep, we mean we return a NotReady to the runtime which will sleep the task.
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop{
+            if self.to_provider.is_full() {
+                let task = task::current();
+                if let Err(_) = self.await_provider.try_send(task) {
+                    task::current().notify();
+                }
+                return Ok(Async::NotReady)
+            }
+            let input_packet_option: Option<Packet> = try_ready!(self.input_stream.poll());
+
+            match input_packet_option {
+                None => {
+                    return Ok(Async::Ready(()))
+                },
+                Some(packet) => {
+                    if let Err(err) = self.to_provider.try_send(Some(packet)) {
+                        panic!("Error in to_provider sender, have nowhere to put packet: {:?}", err);
+                    }
+                    if let Ok(task) = self.wake_provider.try_recv() {
+                        task.notify();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct JoinElementProvider<Packet: Sized> {
+    from_consumers: Receiver<Option<Packet>>,
+    await_consumers: Sender<task::Task>,
+    wake_consumers: Receiver<task::Task>,
+    consumers_alive: usize
+}
+
+impl<Packet: Sized> JoinElementProvider<Packet> {
+    fn new(
+        from_consumers: Receiver<Option<Packet>>, 
+        await_consumers: Sender<task::Task>, 
+        wake_consumers: Receiver<task::Task>,
+        consumers_alive: usize
+        ) -> Self {
+            JoinElementProvider {
+                from_consumers,
+                await_consumers,
+                wake_consumers,
+                consumers_alive
+            }
+    }
+}
+
+impl<Packet: Sized> Drop for JoinElementProvider<Packet> {
+    fn drop(&mut self) {
+        let tasks: Vec<_> = self.wake_consumers.try_iter().collect();
+        for task in tasks {
+            task.notify();
+        }
+    }
+}
+
+impl<Packet: Sized> Stream for JoinElementProvider<Packet> {
+    type Item = Packet;
+    type Error = ();
+
+    /// Elaborate on this later, the weirdness of receiving a none.
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.from_consumers.try_recv() {
+            Ok(Some(packet)) => {
+                let tasks: Vec<_> = self.wake_consumers.try_iter().collect();
+                for task in tasks {
+                    task.notify();
+                }
+                Ok(Async::Ready(Some(packet)))
+            },
+            Ok(None) => {
+                //Got a none from a consumer that has shutdown
+                self.consumers_alive -= 1;
+                if self.consumers_alive == 0 {
+                    return Ok(Async::Ready(None));                   
+                }
+                // Need to return something, so we might as well just call our own Poll again until it
+                // resolves, there may be a ton of Nones in the queue, packets, or it may be empty.
+                return self.poll();
+            },
+            Err(TryRecvError::Empty) => {
+                let task = task::current();
+                if let Err(_) = self.await_consumers.try_send(task) {
+                    task::current().notify();
+                }
+                Ok(Async::NotReady)
+            },
+            Err(TryRecvError::Disconnected) => {
+                Ok(Async::Ready(None))
+            }
+        }
+    }
+}
