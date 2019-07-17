@@ -1,5 +1,6 @@
 use futures::{Future, Stream, Async, Poll, task};
 use crossbeam::crossbeam_channel::{bounded, Sender, Receiver, TryRecvError};
+use crossbeam::crossbeam_channel;
 
 pub type ElementStream<Input> = Box<dyn Stream<Item = Input, Error = ()> + Send>;
 
@@ -177,7 +178,7 @@ impl<E: AsyncElement> Future for AsyncElementConsumer<E> {
                     if let Ok(task) = self.wake_provider.try_recv() {
                         task.notify();
                     }
-                },
+                }
             }
         }
     }
@@ -194,12 +195,16 @@ pub struct AsyncElementProvider<E: AsyncElement> {
 }
 
 impl<E: AsyncElement> AsyncElementProvider<E> {
-    fn new(from_consumer: Receiver<Option<E::Output>>, await_consumer: Sender<task::Task>, wake_consumer: Receiver<task::Task>) -> Self {
-        AsyncElementProvider {
-            from_consumer,
-            await_consumer,
-            wake_consumer
-        }
+    fn new(
+        from_consumer: Receiver<Option<E::Output>>, 
+        await_consumer: Sender<task::Task>, 
+        wake_consumer: Receiver<task::Task>
+        ) -> Self {
+            AsyncElementProvider {
+                from_consumer,
+                await_consumer,
+                wake_consumer
+            }
     }
 }
 
@@ -213,6 +218,210 @@ impl<E: AsyncElement> Drop for AsyncElementProvider<E> {
 
 impl<E: AsyncElement> Stream for AsyncElementProvider<E> {
     type Item = E::Output;
+    type Error = ();
+
+    ///Implement Poll for Stream for AsyncElementProvider
+    /// 
+    /// This function, tries to retrieve a packet off the `from_consumer`
+    /// channel, there are four cases: 
+    /// ###
+    /// #1 Ok(Some(Packet)): Got a packet.if the consumer needs (likely due to 
+    /// an until now full channel) to be awoken, wake them. Return the Async::Ready(Option(Packet))
+    /// 
+    /// #2 Ok(None): this means that the consumer is in tear-down, and we
+    /// will no longer be receivig packets. Return Async::Ready(None) to forward propagate teardown
+    /// 
+    /// #3 Err(TryRecvError::Empty): Packet queue is empty, await the consumer to awaken us with more
+    /// work, and return Async::NotReady to signal to runtime to sleep this task.
+    /// 
+    /// #4 Err(TryRecvError::Disconnected): Consumer is in teardown and has dropped its side of the
+    /// from_consumer channel; we will no longer receive packets. Return Async::Ready(None) to forward
+    /// propagate teardown.
+    /// ###
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        match self.from_consumer.try_recv() {
+            Ok(Some(packet)) => {
+                if let Ok(task) = self.wake_consumer.try_recv() {
+                        task.notify();
+                }
+                Ok(Async::Ready(Some(packet)))
+            },
+            Ok(None) => {
+                Ok(Async::Ready(None))
+            },
+            Err(TryRecvError::Empty) => {
+                let task = task::current();
+                if let Err(_) = self.await_consumer.try_send(task) {
+                    task::current().notify();
+                }
+                Ok(Async::NotReady)
+            },
+            Err(TryRecvError::Disconnected) => {
+                Ok(Async::Ready(None))
+            }
+        }
+    }
+}
+
+pub trait SplitElement {
+    type Packet: Sized;
+
+    fn split(&mut self, packet: Self::Packet) -> (usize, Self::Packet);
+}
+
+pub struct SplitElementLink<E: SplitElement> {
+    pub consumer: SplitElementConsumer<E>,
+    pub providers: Vec<SplitElementProvider<E>>,
+}
+
+impl<E: SplitElement> SplitElementLink<E> {
+    pub fn new(input_stream: ElementStream<E::Packet>, element: E, queue_capacity: usize, branches: usize) -> Self {
+        assert!( branches <= 1000, format!("Split Element branches: {} > 1000", branches)); //Let's be reasonable here
+        assert!( queue_capacity <= 1000, format!("Split Element queue_capacity: {} > 1000", queue_capacity));
+
+        let mut to_providers: Vec<crossbeam_channel::Sender<Option<E::Packet>>> = Vec::new();
+        let mut await_providers: Vec<crossbeam_channel::Sender<task::Task>> = Vec::new();
+        let mut wake_providers: Vec<crossbeam_channel::Receiver<task::Task>> = Vec::new();
+        let mut providers: Vec<SplitElementProvider<E>> = Vec::new();
+
+        for _ in 0..branches {
+            let (to_provider, from_consumer) = crossbeam_channel::bounded::<Option<E::Packet>>(queue_capacity);
+            let (await_consumer, wake_provider) = bounded::<task::Task>(1);
+            let (await_provider, wake_consumer) = bounded::<task::Task>(1);
+
+            let provider = SplitElementProvider::new(from_consumer, await_consumer, wake_consumer);
+
+            to_providers.push(to_provider);
+            await_providers.push(await_provider);
+            wake_providers.push(wake_provider);
+            providers.push(provider);
+        }
+
+        SplitElementLink {
+            consumer: SplitElementConsumer::new(input_stream, to_providers, element, await_providers, wake_providers),
+            providers
+        }
+    }
+}
+
+pub struct SplitElementConsumer<E: SplitElement> {
+    input_stream: ElementStream<E::Packet>,
+    to_providers: Vec<crossbeam_channel::Sender<Option<E::Packet>>>,
+    element: E,
+    await_providers: Vec<crossbeam_channel::Sender<task::Task>>,
+    wake_providers: Vec<crossbeam_channel::Receiver<task::Task>>
+}
+
+impl<E: SplitElement> SplitElementConsumer<E> {
+    fn new(
+        input_stream: ElementStream<E::Packet>,
+        to_providers: Vec<crossbeam_channel::Sender<Option<E::Packet>>>,
+        element: E,
+        await_providers: Vec<crossbeam_channel::Sender<task::Task>>,
+        wake_providers: Vec<crossbeam_channel::Receiver<task::Task>>
+    ) -> Self {
+        SplitElementConsumer {
+            input_stream,
+            to_providers,
+            element,
+            await_providers,
+            wake_providers
+        }
+    }
+}
+
+impl<E: SplitElement> Drop for SplitElementConsumer<E> {
+    fn drop(&mut self) {
+        //TODO: do this with a closure or something, this could be a one-liner
+        for to_provider in self.to_providers.iter() {
+            if let Err(err) = to_provider.try_send(None) {
+                panic!("Consumer: Drop: try_send to provider, fail?: {:?}", err);
+            }
+        }
+
+        for wake_provider in self.wake_providers.iter() {
+            if let Ok(task) = wake_provider.try_recv() {
+                task.notify();
+            }
+        }
+    }
+}
+
+impl<E: SplitElement> Future for SplitElementConsumer<E> {
+    type Item = ();
+    type Error = ();
+
+    /// Same logic as AsyncElementConsumer, except if any of the channels are full we
+    /// await that channel to clear before processing a new packet. This is somewhat
+    /// inefficient, but seems acceptable for now since we want to yield compute to 
+    /// that producer, as there is a backup.
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            for (port, to_provider) in self.to_providers.iter().enumerate() {
+                if to_provider.is_full() {
+                    let task = task::current();
+                    if let Err(_) = self.await_providers[port].try_send(task) {
+                        task::current().notify();
+                    }
+                    return Ok(Async::NotReady)
+                }
+            }
+            let packet_option: Option<E::Packet> = try_ready!(self.input_stream.poll());
+
+            match packet_option {
+                None => {
+                    return Ok(Async::Ready(()))
+                },
+                Some(packet) => {
+                    let (port, packet) = self.element.split(packet);
+                    if port >= self.to_providers.len() {
+                        panic!("Tried to access invalid port: {}", port);
+                    }
+                    if let Err(err) = self.to_providers[port].try_send(Some(packet)) {
+                        panic!("Error in to_providers[{}] sender, have nowhere to put packet: {:?}", port, err);
+                    }
+                    if let Ok(task) = self.wake_providers[port].try_recv() {
+                        task.notify();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Split Element Provider, exactly the same as AsyncElementProvider, but
+/// they have different trait bounds. Hence the reimplementaton. Would love
+/// a PR that solves this problem.
+pub struct SplitElementProvider<E: SplitElement> {
+    from_consumer: crossbeam_channel::Receiver<Option<E::Packet>>,
+    await_consumer: crossbeam_channel::Sender<task::Task>,
+    wake_consumer: crossbeam_channel::Receiver<task::Task>,
+}
+
+impl<E: SplitElement> SplitElementProvider<E> {
+    fn new(
+        from_consumer: crossbeam_channel::Receiver<Option<E::Packet>>,
+        await_consumer: crossbeam_channel::Sender<task::Task>,
+        wake_consumer: crossbeam_channel::Receiver<task::Task>
+    ) -> Self {
+        SplitElementProvider {
+            from_consumer,
+            await_consumer,
+            wake_consumer
+        }
+    }
+}
+
+impl<E: SplitElement> Drop for SplitElementProvider<E> {
+    fn drop(&mut self) {
+        if let Ok(task) = self.wake_consumer.try_recv() {
+            task.notify();
+        }
+    }
+}
+
+impl<E: SplitElement> Stream for SplitElementProvider<E> {
+    type Item = E::Packet;
     type Error = ();
 
     ///Implement Poll for Stream for AsyncElementProvider
