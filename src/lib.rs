@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn one_sync_element_collected_yield() {
-        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7];
+        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7, 8, 9];
         let packet_generator = PacketIntervalGenerator::new(time::Duration::from_millis(100), packets.clone().into_iter());
 
         let elem1 = IdentityElement { id: 0 };
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn one_async_element_collected_yield() {
         let default_channel_size = 10;
-        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7];
+        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7, 8 , 9];
         let packet_generator = PacketIntervalGenerator::new(time::Duration::from_millis(100), packets.clone().into_iter());
 
         let elem0 = AsyncIdentityElement { id: 0 };
@@ -258,7 +258,7 @@ mod tests {
     #[test]
     fn two_async_elements_collected_yield() {
         let default_channel_size = 10;
-        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7];
+        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7, 8 ,9];
         let packet_generator = PacketIntervalGenerator::new(time::Duration::from_millis(100), packets.clone().into_iter());
 
         let elem0 = AsyncIdentityElement { id: 0 };
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn series_sync_and_async_collected_yield() {
         let default_channel_size = 10;
-        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7];
+        let packets = vec![0, 1, 2, 420, 1337, 3, 4, 5, 6, 7, 8, 9];
         let packet_generator = PacketIntervalGenerator::new(time::Duration::from_millis(100), packets.clone().into_iter());
 
         let elem0 = IdentityElement { id: 0 };
